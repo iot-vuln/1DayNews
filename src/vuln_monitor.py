@@ -894,12 +894,29 @@ _FRESHNESS_DAYS = 60
 _nvd_cache = {}       # cve_id → {"published":"YYYY-MM-DD","cvss":float,"severity":str} or "" or None
 _nvd_detail_cache = {}  # full detail cache for LLM tools
 
+# NVD circuit breaker: when NVD repeatedly rate-limits (HTTP 403/429), stop
+# making live lookups for the rest of the run instead of sleeping ~6.5s before
+# every doomed request (without an API key NVD allows only 5 req/30s, so a
+# rate-limit storm makes `fetch` appear frozen). Reset per run in _warm_nvd_cache.
+_NVD_CIRCUIT_THRESHOLD = 3
+_nvd_ratelimit_hits = 0          # consecutive rate-limit responses this run
+_nvd_circuit_open = False        # once True, skip all live NVD queries this run
+_nvd_ratelimited_this_run = set()  # CVEs already rate-limited this run (skip re-sleep)
+
+def _reset_nvd_circuit():
+    """Reset NVD circuit-breaker state at the start of a run."""
+    global _nvd_ratelimit_hits, _nvd_circuit_open
+    _nvd_ratelimit_hits = 0
+    _nvd_circuit_open = False
+    _nvd_ratelimited_this_run.clear()
+
 def _nvd_detail(cve_id):
     """Query NVD for CVE detail. Returns dict or None.
 
     Returns: {"published": "YYYY-MM-DD", "cvss": float, "severity": str, "description": str}
     Cache: in-memory dict → NVD API. DB cache handled by caller.
     """
+    global _nvd_ratelimit_hits, _nvd_circuit_open
     cve_upper = cve_id.upper()
     # check full detail cache
     if cve_upper in _nvd_detail_cache:
@@ -915,6 +932,10 @@ def _nvd_detail(cve_id):
             # have date in cache but no full detail yet — build partial detail, don't re-query NVD
             _nvd_detail_cache[cve_upper] = {"published": cached, "cvss": None, "severity": None, "description": "", "vector": None}
             return _nvd_detail_cache[cve_upper]
+    # circuit breaker: NVD is rate-limiting us this run — skip live lookup (and
+    # the ~6.5s pre-request sleep) entirely so the run doesn't appear frozen.
+    if _nvd_circuit_open or cve_upper in _nvd_ratelimited_this_run:
+        return None
     # query NVD (rate limit: 50 req/30s with key, 5 req/30s without)
     _nvd_sleep = 0.7 if NVD_API_KEY else 6.5
     time.sleep(_nvd_sleep)
@@ -924,9 +945,21 @@ def _nvd_detail(cve_id):
             hdrs["apiKey"] = NVD_API_KEY
         r = SESS.get(_NVD_API, params={"cveId": cve_upper}, timeout=10, headers=hdrs)  # Fix #6: use SESS for proxy
         if r.status_code in (403, 429):
-            # rate limited — DON'T cache, allow retry next cycle
-            log.debug(f"NVD rate limited for {cve_upper}")
+            # rate limited — DON'T persist to cache (allow retry next run), but
+            # remember within this run and trip the circuit breaker after a few
+            # hits so we stop sleeping 6.5s before every doomed request.
+            _nvd_ratelimited_this_run.add(cve_upper)
+            _nvd_ratelimit_hits += 1
+            if not _nvd_circuit_open and _nvd_ratelimit_hits >= _NVD_CIRCUIT_THRESHOLD:
+                _nvd_circuit_open = True
+                log.warning(
+                    "NVD rate-limited %d times; disabling live NVD lookups for "
+                    "the rest of this run (set NVD_API_KEY to raise the limit)",
+                    _nvd_ratelimit_hits)
+            else:
+                log.debug(f"NVD rate limited for {cve_upper}")
             return None
+        _nvd_ratelimit_hits = 0  # successful response — reset breaker counter
         if r.status_code != 200:
             _nvd_cache[cve_upper] = ""
             return None
@@ -1483,6 +1516,7 @@ def _warm_nvd_cache(conn):
     """Pre-load DB cve_published values into in-memory cache at startup."""
     _nvd_cache.clear()
     _nvd_detail_cache.clear()  # Fix #9: prevent unbounded memory growth
+    _reset_nvd_circuit()       # reset NVD rate-limit breaker for this run
     try:
         rows = conn.execute("SELECT cve_id, cve_published FROM vulns WHERE cve_published IS NOT NULL").fetchall()
         for cve_id, pub in rows:
