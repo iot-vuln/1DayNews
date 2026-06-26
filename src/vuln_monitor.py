@@ -1525,6 +1525,19 @@ def _warm_nvd_cache(conn):
     except Exception:
         pass
 
+def _cached_latest_pub(cves):
+    """Latest NVD publish date among `cves` using only the warmed cache.
+
+    Never triggers a live NVD lookup — used for high-trust / old-CVE paths where
+    the date is informational and missing values are backfilled later.
+    """
+    latest = None
+    for c in cves:
+        cached = _nvd_cache.get(c.upper())
+        if isinstance(cached, str) and cached and (latest is None or cached > latest):
+            latest = cached
+    return latest
+
 def _is_fresh(source, text):
     """Is this a fresh vulnerability disclosure (1day), not an nday rehash?
 
@@ -1535,25 +1548,8 @@ def _is_fresh(source, text):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=_FRESHNESS_DAYS)
     year = now.year
-    latest_pub_str = None
-    has_nvd_confirmed_recent = False
-    has_recent_year = False
-    for c in cves:
-        pub_dt, pub_str = _nvd_published_date(c.upper())
-        if pub_str:
-            if latest_pub_str is None or pub_str > latest_pub_str:
-                latest_pub_str = pub_str
-            if pub_dt and pub_dt >= cutoff:
-                has_nvd_confirmed_recent = True
-        else:
-            # NVD unavailable — track year for high-trust fallback only
-            try:
-                cve_year = int(c.split("-")[1])
-                if cve_year >= year - 1:
-                    has_recent_year = True
-            except (IndexError, ValueError):
-                pass
-    # hard cutoff: if ALL CVEs are > 1 year old → nday
+
+    # hard cutoff (year-based, no network): if ALL CVEs are > 1 year old → nday.
     if cves:
         all_old = True
         for c in cves:
@@ -1566,14 +1562,30 @@ def _is_fresh(source, text):
                 all_old = False
                 break
         if all_old:
-            return False, latest_pub_str, "old_cve"
-    # high-trust sources: trust timeliness (NVD confirmed OR recent CVE year)
+            return False, _cached_latest_pub(cves), "old_cve"
+
+    # high-trust sources: trusted as fresh — do NOT pay for live NVD lookups here
+    # (there can be thousands of high-trust items per run, e.g. GHSA). The
+    # publish date is read from cache if present and otherwise backfilled later
+    # by _backfill_nvd_severity.
     if source in FRESH_SOURCES:
-        return True, latest_pub_str, "high_trust_source"
+        return True, _cached_latest_pub(cves), "high_trust_source"
+
     # low-trust sources: no CVE = can't verify
     if not cves:
         return False, None, "no_cve_low_trust"
-    # low-trust with CVE: require actual NVD confirmation, year fallback not trusted
+
+    # low-trust with CVE: require actual NVD confirmation (live lookup, bounded
+    # by the NVD circuit breaker). Year fallback is not trusted here.
+    latest_pub_str = None
+    has_nvd_confirmed_recent = False
+    for c in cves:
+        pub_dt, pub_str = _nvd_published_date(c.upper())
+        if pub_str:
+            if latest_pub_str is None or pub_str > latest_pub_str:
+                latest_pub_str = pub_str
+            if pub_dt and pub_dt >= cutoff:
+                has_nvd_confirmed_recent = True
     if has_nvd_confirmed_recent:
         return True, latest_pub_str, "nvd_60d"
     return False, latest_pub_str, "nvd_60d"
