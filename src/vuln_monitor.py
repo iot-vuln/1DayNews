@@ -894,12 +894,29 @@ _FRESHNESS_DAYS = 60
 _nvd_cache = {}       # cve_id → {"published":"YYYY-MM-DD","cvss":float,"severity":str} or "" or None
 _nvd_detail_cache = {}  # full detail cache for LLM tools
 
+# NVD circuit breaker: when NVD repeatedly rate-limits (HTTP 403/429), stop
+# making live lookups for the rest of the run instead of sleeping ~6.5s before
+# every doomed request (without an API key NVD allows only 5 req/30s, so a
+# rate-limit storm makes `fetch` appear frozen). Reset per run in _warm_nvd_cache.
+_NVD_CIRCUIT_THRESHOLD = 3
+_nvd_ratelimit_hits = 0          # consecutive rate-limit responses this run
+_nvd_circuit_open = False        # once True, skip all live NVD queries this run
+_nvd_ratelimited_this_run = set()  # CVEs already rate-limited this run (skip re-sleep)
+
+def _reset_nvd_circuit():
+    """Reset NVD circuit-breaker state at the start of a run."""
+    global _nvd_ratelimit_hits, _nvd_circuit_open
+    _nvd_ratelimit_hits = 0
+    _nvd_circuit_open = False
+    _nvd_ratelimited_this_run.clear()
+
 def _nvd_detail(cve_id):
     """Query NVD for CVE detail. Returns dict or None.
 
     Returns: {"published": "YYYY-MM-DD", "cvss": float, "severity": str, "description": str}
     Cache: in-memory dict → NVD API. DB cache handled by caller.
     """
+    global _nvd_ratelimit_hits, _nvd_circuit_open
     cve_upper = cve_id.upper()
     # check full detail cache
     if cve_upper in _nvd_detail_cache:
@@ -915,6 +932,10 @@ def _nvd_detail(cve_id):
             # have date in cache but no full detail yet — build partial detail, don't re-query NVD
             _nvd_detail_cache[cve_upper] = {"published": cached, "cvss": None, "severity": None, "description": "", "vector": None}
             return _nvd_detail_cache[cve_upper]
+    # circuit breaker: NVD is rate-limiting us this run — skip live lookup (and
+    # the ~6.5s pre-request sleep) entirely so the run doesn't appear frozen.
+    if _nvd_circuit_open or cve_upper in _nvd_ratelimited_this_run:
+        return None
     # query NVD (rate limit: 50 req/30s with key, 5 req/30s without)
     _nvd_sleep = 0.7 if NVD_API_KEY else 6.5
     time.sleep(_nvd_sleep)
@@ -924,9 +945,21 @@ def _nvd_detail(cve_id):
             hdrs["apiKey"] = NVD_API_KEY
         r = SESS.get(_NVD_API, params={"cveId": cve_upper}, timeout=10, headers=hdrs)  # Fix #6: use SESS for proxy
         if r.status_code in (403, 429):
-            # rate limited — DON'T cache, allow retry next cycle
-            log.debug(f"NVD rate limited for {cve_upper}")
+            # rate limited — DON'T persist to cache (allow retry next run), but
+            # remember within this run and trip the circuit breaker after a few
+            # hits so we stop sleeping 6.5s before every doomed request.
+            _nvd_ratelimited_this_run.add(cve_upper)
+            _nvd_ratelimit_hits += 1
+            if not _nvd_circuit_open and _nvd_ratelimit_hits >= _NVD_CIRCUIT_THRESHOLD:
+                _nvd_circuit_open = True
+                log.warning(
+                    "NVD rate-limited %d times; disabling live NVD lookups for "
+                    "the rest of this run (set NVD_API_KEY to raise the limit)",
+                    _nvd_ratelimit_hits)
+            else:
+                log.debug(f"NVD rate limited for {cve_upper}")
             return None
+        _nvd_ratelimit_hits = 0  # successful response — reset breaker counter
         if r.status_code != 200:
             _nvd_cache[cve_upper] = ""
             return None
@@ -1483,6 +1516,7 @@ def _warm_nvd_cache(conn):
     """Pre-load DB cve_published values into in-memory cache at startup."""
     _nvd_cache.clear()
     _nvd_detail_cache.clear()  # Fix #9: prevent unbounded memory growth
+    _reset_nvd_circuit()       # reset NVD rate-limit breaker for this run
     try:
         rows = conn.execute("SELECT cve_id, cve_published FROM vulns WHERE cve_published IS NOT NULL").fetchall()
         for cve_id, pub in rows:
@@ -1490,6 +1524,19 @@ def _warm_nvd_cache(conn):
                 _nvd_cache[cve_id] = pub
     except Exception:
         pass
+
+def _cached_latest_pub(cves):
+    """Latest NVD publish date among `cves` using only the warmed cache.
+
+    Never triggers a live NVD lookup — used for high-trust / old-CVE paths where
+    the date is informational and missing values are backfilled later.
+    """
+    latest = None
+    for c in cves:
+        cached = _nvd_cache.get(c.upper())
+        if isinstance(cached, str) and cached and (latest is None or cached > latest):
+            latest = cached
+    return latest
 
 def _is_fresh(source, text):
     """Is this a fresh vulnerability disclosure (1day), not an nday rehash?
@@ -1501,25 +1548,8 @@ def _is_fresh(source, text):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=_FRESHNESS_DAYS)
     year = now.year
-    latest_pub_str = None
-    has_nvd_confirmed_recent = False
-    has_recent_year = False
-    for c in cves:
-        pub_dt, pub_str = _nvd_published_date(c.upper())
-        if pub_str:
-            if latest_pub_str is None or pub_str > latest_pub_str:
-                latest_pub_str = pub_str
-            if pub_dt and pub_dt >= cutoff:
-                has_nvd_confirmed_recent = True
-        else:
-            # NVD unavailable — track year for high-trust fallback only
-            try:
-                cve_year = int(c.split("-")[1])
-                if cve_year >= year - 1:
-                    has_recent_year = True
-            except (IndexError, ValueError):
-                pass
-    # hard cutoff: if ALL CVEs are > 1 year old → nday
+
+    # hard cutoff (year-based, no network): if ALL CVEs are > 1 year old → nday.
     if cves:
         all_old = True
         for c in cves:
@@ -1532,14 +1562,30 @@ def _is_fresh(source, text):
                 all_old = False
                 break
         if all_old:
-            return False, latest_pub_str, "old_cve"
-    # high-trust sources: trust timeliness (NVD confirmed OR recent CVE year)
+            return False, _cached_latest_pub(cves), "old_cve"
+
+    # high-trust sources: trusted as fresh — do NOT pay for live NVD lookups here
+    # (there can be thousands of high-trust items per run, e.g. GHSA). The
+    # publish date is read from cache if present and otherwise backfilled later
+    # by _backfill_nvd_severity.
     if source in FRESH_SOURCES:
-        return True, latest_pub_str, "high_trust_source"
+        return True, _cached_latest_pub(cves), "high_trust_source"
+
     # low-trust sources: no CVE = can't verify
     if not cves:
         return False, None, "no_cve_low_trust"
-    # low-trust with CVE: require actual NVD confirmation, year fallback not trusted
+
+    # low-trust with CVE: require actual NVD confirmation (live lookup, bounded
+    # by the NVD circuit breaker). Year fallback is not trusted here.
+    latest_pub_str = None
+    has_nvd_confirmed_recent = False
+    for c in cves:
+        pub_dt, pub_str = _nvd_published_date(c.upper())
+        if pub_str:
+            if latest_pub_str is None or pub_str > latest_pub_str:
+                latest_pub_str = pub_str
+            if pub_dt and pub_dt >= cutoff:
+                has_nvd_confirmed_recent = True
     if has_nvd_confirmed_recent:
         return True, latest_pub_str, "nvd_60d"
     return False, latest_pub_str, "nvd_60d"
@@ -1860,6 +1906,7 @@ def _fetch_all_sources():
         items.extend(batch)
     for name, func in [("CISA_KEV", fetch_kev_json), ("Chaitin", fetch_chaitin),
                         ("ThreatBook", fetch_threatbook),
+                        ("GitHub", fetch_github_cve),
                         ("PoC-GitHub", fetch_poc_in_github),
                         ("GHSA", fetch_github_advisories)]:
         batch = func()
