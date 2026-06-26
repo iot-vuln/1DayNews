@@ -1906,6 +1906,7 @@ def _fetch_all_sources():
         items.extend(batch)
     for name, func in [("CISA_KEV", fetch_kev_json), ("Chaitin", fetch_chaitin),
                         ("ThreatBook", fetch_threatbook),
+                        ("GitHub", fetch_github_cve),
                         ("PoC-GitHub", fetch_poc_in_github),
                         ("GHSA", fetch_github_advisories)]:
         batch = func()
